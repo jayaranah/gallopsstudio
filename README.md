@@ -67,7 +67,7 @@
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/<your-username>/gallops-studio.git
+   git clone https://github.com/jayaranah/gallopsstudio.git
    cd gallops-studio
    ```
 2. Install dependencies:
@@ -144,4 +144,12 @@ This project is licensed under the [MIT License](LICENSE).
 
 ## 🙌 Credits
 
+
 Gallops Studio — © 2026 Jay-ar Volante / Gallops Sound / Gallops OPM
+
+[FFmpeg](https://ffmpeg.org/)
+
+[Youtube Channel: Gallops OPM](https://www.youtube.com/@GallopsOPM)
+
+[Youtube Channel: Gallops Sound](https://www.youtube.com/@GallopsSound)
+
