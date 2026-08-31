@@ -57,7 +57,8 @@ UNDO_MAX      = 50
 # Keys deliberately left out of saved presets — a preset is a "look", not a
 # reference to specific media files, so the currently loaded audio, lyrics,
 # and background image/video are always left untouched by save/load preset.
-PRESET_EXCLUDED_KEYS = {"audio_path", "lrc_path", "bg_image_path", "bg_video_path"}
+PRESET_EXCLUDED_KEYS = {"audio_path", "lrc_path", "bg_image_path", "bg_video_path",
+                         "bg_images", "bg_images_dir"}
 
 LYRIC_STYLES   = ["filled", "outline", "glow", "gradient"]
 LIGHTS_PATTERNS = ["random", "sync", "wave", "alternate", "converge", "chase",
@@ -183,6 +184,32 @@ def _find_ffmpeg() -> str:
 
 FFMPEG_BIN = _find_ffmpeg()
 
+def get_app_version() -> Tuple[str, str]:
+    """Read (version, notes) from VERSION.txt — works both running from
+    source and when frozen by PyInstaller (VERSION.txt is bundled as a
+    data file, see gallops_studio.spec)."""
+    bundle = getattr(sys, "_MEIPASS", None)
+    candidates = []
+    if bundle:
+        candidates.append(os.path.join(bundle, "VERSION.txt"))
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION.txt"))
+    version, notes = "1.0.0", ""
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.rstrip("\n")
+                        if line.startswith("VERSION="):
+                            version = line.split("=", 1)[1].strip()
+                        elif line.startswith("NOTES="):
+                            notes = line.split("=", 1)[1].strip()
+                break
+            except Exception:
+                pass
+    return version, notes
+
+
 def get_audio_duration(path: str) -> Optional[float]:
     try:
         r = subprocess.run(
@@ -227,6 +254,23 @@ def _linux_fonts() -> Dict[str, str]:
     cands = {"Liberation Sans":"/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
              "DejaVu Sans":"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"}
     return {k:v for k,v in cands.items() if os.path.exists(v)}
+
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+
+def scan_images_in_dir(dir_path: str) -> List[str]:
+    """List lahat ng image files na direkta nasa loob ng dir_path (hindi
+    kasama yung mga subfolder)."""
+    if not dir_path or not os.path.isdir(dir_path):
+        return []
+    out = []
+    try:
+        for fn in sorted(os.listdir(dir_path)):
+            if os.path.splitext(fn)[1].lower() in IMAGE_EXTS:
+                out.append(os.path.join(dir_path, fn))
+    except Exception as e:
+        print(f"[BG Dir] scan failed: {e}")
+    return out
 
 # ─── Custom fonts ──────────────────────────────────────────────────────────
 def get_custom_fonts() -> Dict[str, str]:
@@ -362,6 +406,17 @@ class Settings:
         self.lrc_path:   Optional[str] = None
         self.bg_video_path: Optional[str] = None
         self.bg_video_muted = True
+        # ── Background image slideshow ──────────────────────────────────
+        self.bg_images: List[str] = []          # multiple images for the slideshow
+        self.bg_images_dir: Optional[str] = None        # folder to randomly pull images from
+        self.bg_images_random_count = 10                # how many random images to grab from that folder
+        self.bg_slideshow_enabled = False
+        self.bg_slideshow_interval = 50          # tenths of a second per slide (50 = 5.0s)
+        self.bg_slideshow_transition = "fade"    # none|fade|slide_left|slide_right|slide_up|slide_down
+        self.bg_slideshow_transition_duration = 10  # tenths of a second (10 = 1.0s)
+        self.bg_zoom_enabled = False             # Ken Burns zoom in/out on background images
+        self.bg_zoom_speed = 8                   # % zoom growth per second
+        self.bg_zoom_direction = "in"            # in|out|alternate|random
         self.color_sung = _C_SUNG; self.color_next = _C_NEXT
         self.video_preset = "Standard/720p"
         self.video_resolution = "720p (HD)"
@@ -632,12 +687,24 @@ def make_font(path, size):
 
 class GallopsStudioRenderer:
     """pygame-based renderer — identical logic to original, just extracted."""
+    
+    # How many times larger than the render target we cache the background
+    # at when Ken Burns zoom is on. Must cover the max possible zoom scale
+    # (currently 2.0x — see _slide_zoom_scale) with a little headroom, so
+    # the zoom always DOWNSAMPLES real image data instead of repeatedly
+    # UPSAMPLING an already-downscaled frame. Upsampling a source that's
+    # slightly different in scale every frame is what caused the
+    # shimmering / "shaking" look during the zoom.
+    _ZOOM_HEADROOM = 2.2
+    
+    
     def __init__(self, settings: Settings, video_bg: VideoBackground = None):
         self.settings  = settings
         self.video_bg  = video_bg
         self.export_mode = False
         self._bg_surf  = None; self._bg_key = None
         self._bg_pil_raw = None; self._bg_raw_key = None
+        self._slideshow_cache: Dict = {}
         self._bg_pulse_level = 0.0
         self.last_elapsed = 0.0
         self.slot_top_line_index    = 0
@@ -676,10 +743,13 @@ class GallopsStudioRenderer:
     def invalidate(self):
         _font_cache.clear(); self._bg_surf=None; self._bg_key=None
         self._bg_pil_raw=None; self._bg_raw_key=None
+        self._slideshow_cache = {}
 
     def invalidate_font(self): _font_cache.clear()
 
-    def invalidate_bg(self): self._bg_surf=None; self._bg_key=None
+    def invalidate_bg(self):
+        self._bg_surf=None; self._bg_key=None
+        self._slideshow_cache = {}
 
     def get_bg(self, size):
         p = self.settings.bg_image_path; b = self.settings.bg_blur
@@ -694,6 +764,157 @@ class GallopsStudioRenderer:
             self._bg_surf = pygame.image.fromstring(pil.tobytes(), size, "RGB")
             self._bg_key  = full_key
         return self._bg_surf
+
+    # ── Background image SLIDESHOW (multiple images, Ken Burns zoom, transitions) ──
+    def _get_slideshow_base(self, path, size):
+        """Cached, blur-applied background source for one slideshow image.
+        Returns (surface, headroom) — headroom tells _apply_zoom how many
+        times larger than `size` this surface actually is."""
+        b = getattr(self.settings, "bg_blur", 0)
+        zoom_on = getattr(self.settings, "bg_zoom_enabled", False)
+        headroom = self._ZOOM_HEADROOM if zoom_on else 1.0
+        key = (path, b, size, headroom)
+        cached = self._slideshow_cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            hw = max(1, int(round(size[0] * headroom)))
+            hh = max(1, int(round(size[1] * headroom)))
+            pil = Image.open(path).convert("RGB").resize((hw, hh), Image.BICUBIC)
+            if b > 0:
+                # Scale the blur radius with the headroom so it looks the
+                # same strength after the eventual downscale to `size`.
+                pil = pil.filter(ImageFilter.GaussianBlur(b * 3 * headroom))
+            surf = pygame.image.fromstring(pil.tobytes(), (hw, hh), "RGB")
+        except Exception as e:
+            print(f"[Slideshow] failed to load {path}: {e}")
+            result = (None, 1.0)
+            self._slideshow_cache[key] = result
+            return result
+        if len(self._slideshow_cache) > 24:
+            for k in list(self._slideshow_cache.keys())[:12]:
+                del self._slideshow_cache[k]
+        result = (surf, headroom)
+        self._slideshow_cache[key] = result
+        return result
+
+    def _slide_zoom_scale(self, idx, t, duration, smooth_loop=False):
+        """Return the Ken Burns zoom scale (>=1.0) for slide `idx` at time
+        `t` (seconds into that slide, 0..duration). `speed` is %/second of
+        extra zoom; `direction` picks in/out/alternate/random per slide.
+        `smooth_loop=True` is used for the single-image case, where the
+        zoom must oscillate smoothly forever instead of resetting."""
+        s = self.settings
+        if not getattr(s, "bg_zoom_enabled", False):
+            return 1.0
+        speed = max(0, min(50, getattr(s, "bg_zoom_speed", 8))) / 100.0
+        direction = getattr(s, "bg_zoom_direction", "in")
+        if direction == "random":
+            rnd = (math.sin((idx + 1) * 12.9898) * 43758.5453) % 1.0
+            eff_dir = "in" if rnd < 0.5 else "out"
+        elif direction == "alternate":
+            eff_dir = "in" if idx % 2 == 0 else "out"
+        else:
+            eff_dir = direction
+        max_extra = min(1.0, speed * max(0.001, duration))
+        if smooth_loop and duration > 0:
+            phase = (t / duration) % 1.0
+            if eff_dir == "out":
+                phase = (phase + 0.5) % 1.0
+            frac = 0.5 - 0.5 * math.cos(phase * math.tau)
+        else:
+            frac = max(0.0, min(1.0, (t / duration) if duration > 0 else 0.0))
+            if eff_dir == "out":
+                frac = 1.0 - frac
+        return 1.0 + max_extra * frac
+
+    def _apply_zoom(self, base, size, scale, headroom=1.0):
+        """Center-cropped zoom, downsampled from a (possibly hi-res) `base`
+        down to `size`. `headroom` = how many times larger than `size` the
+        base actually is. Cropping-then-downscaling (instead of the old
+        upscale-then-crop) is what removes the shimmer."""
+        if base is None:
+            return None
+        if scale <= 1.001:
+            if headroom <= 1.001:
+                return base
+            return pygame.transform.smoothscale(base, size)
+        sw, sh = size
+        bw, bh = base.get_size()
+        eff = min(scale, headroom) if headroom > 1.001 else scale
+        crop_w = min(bw, max(1, int(round(bw / eff))))
+        crop_h = min(bh, max(1, int(round(bh / eff))))
+        cx = (bw - crop_w) // 2
+        cy = (bh - crop_h) // 2
+        cropped = base.subsurface(pygame.Rect(cx, cy, crop_w, crop_h))
+        if (crop_w, crop_h) == size:
+            return cropped.copy()
+        return pygame.transform.smoothscale(cropped, size)
+
+    def _blend_transition(self, cur, nxt, t, size, kind):
+        """Composite `cur` -> `nxt` at progress t (0..1) using the chosen
+        transition style: crossfade or a directional push/slide."""
+        if cur is None:
+            return nxt
+        if nxt is None:
+            return cur
+        sw, sh = size
+        if kind == "none":
+            return nxt if t >= 1.0 else cur
+        if kind == "fade":
+            out = cur.copy()
+            n2 = nxt.copy()
+            n2.set_alpha(int(255 * t))
+            out.blit(n2, (0, 0))
+            return out
+        out = pygame.Surface(size)
+        if kind == "slide_left":
+            cx = int(-t * sw); out.blit(cur, (cx, 0)); out.blit(nxt, (sw + cx, 0))
+        elif kind == "slide_right":
+            cx = int(t * sw); out.blit(cur, (cx, 0)); out.blit(nxt, (cx - sw, 0))
+        elif kind == "slide_up":
+            cy = int(-t * sh); out.blit(cur, (0, cy)); out.blit(nxt, (0, sh + cy))
+        elif kind == "slide_down":
+            cy = int(t * sh); out.blit(cur, (0, cy)); out.blit(nxt, (0, cy - sh))
+        else:
+            return cur if t < 0.5 else nxt
+        return out
+
+    def get_bg_slideshow(self, size, elapsed):
+        s = self.settings
+        images = [p for p in getattr(s, "bg_images", []) if p and os.path.exists(p)]
+        if not images:
+            return self.get_bg(size)
+
+        interval = max(0.5, getattr(s, "bg_slideshow_interval", 50) / 10.0)
+        n = len(images)
+
+        if n == 1 or not getattr(s, "bg_slideshow_enabled", False):
+            base, headroom = self._get_slideshow_base(images[0], size)
+            scale = self._slide_zoom_scale(0, elapsed % interval, interval, smooth_loop=True)
+            return self._apply_zoom(base, size, scale, headroom)
+
+        trans_dur = max(0.0, min(getattr(s, "bg_slideshow_transition_duration", 10) / 10.0,
+                                  interval * 0.9))
+        total_cycle = interval * n
+        t_cycle = elapsed % total_cycle
+        idx = min(int(t_cycle // interval), n - 1)
+        t_slide = t_cycle - idx * interval
+        next_idx = (idx + 1) % n
+
+        base_cur, hr_cur = self._get_slideshow_base(images[idx], size)
+        cur_surf = self._apply_zoom(base_cur, size,
+                                     self._slide_zoom_scale(idx, t_slide, interval), hr_cur)
+
+        if trans_dur > 0 and t_slide >= interval - trans_dur:
+            trans_t = (t_slide - (interval - trans_dur)) / trans_dur
+            trans_t = max(0.0, min(1.0, trans_t))
+            base_next, hr_next = self._get_slideshow_base(images[next_idx], size)
+            next_surf = self._apply_zoom(base_next, size,
+                                          self._slide_zoom_scale(next_idx, 0.0, interval), hr_next)
+            return self._blend_transition(cur_surf, next_surf, trans_t, size,
+                                          getattr(s, "bg_slideshow_transition", "fade"))
+        return cur_surf
 
     # ── The full render method and all helpers are copied verbatim from
     #    the original file.  They are pygame-only and have zero Qt dependency.
@@ -1616,7 +1837,7 @@ class GallopsStudioRenderer:
             if frame: self._blit_bg_with_pulse(surf,frame,(sw,sh),dt)
             else: surf.fill(C_BG)
         else:
-            bg=self.get_bg((sw,sh))
+            bg=self.get_bg_slideshow((sw,sh),elapsed)
             if bg: self._blit_bg_with_pulse(surf,bg,(sw,sh),dt)
             else: surf.fill(C_BG)
         scale_x=sw/DEFAULT_WIN_W; scale_y=sh/DEFAULT_WIN_H; scale=(scale_x+scale_y)/2
@@ -2359,6 +2580,121 @@ class SettingsPanel(QScrollArea):
     def _short(path):
         return os.path.basename(path)[:20] if path else "—"
 
+    @staticmethod
+    def _short_dir(path):
+        if not path:
+            return "—"
+        name = os.path.basename(os.path.normpath(path))
+        return name[:28] if name else path[:28]
+
+    def _build_bg_images_list(self, layout):
+        from PyQt6.QtWidgets import QListWidget, QAbstractItemView
+        lst = QListWidget()
+        lst.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        lst.setMaximumHeight(110)
+        lst.setStyleSheet("font-size:10px;")
+        for p in getattr(self.settings, "bg_images", []):
+            lst.addItem(os.path.basename(p))
+        layout.addWidget(lst)
+
+        btn_row = QHBoxLayout()
+        btn_row.setContentsMargins(0, 0, 0, 0)
+        add_btn = QPushButton("＋ Add Images…")
+        rm_btn  = QPushButton("－ Remove")
+        clr_btn = QPushButton("✕")
+        clr_btn.setFixedWidth(28)
+        clr_btn.setProperty("class", "danger")
+        btn_row.addWidget(add_btn); btn_row.addWidget(rm_btn); btn_row.addWidget(clr_btn)
+        layout.addLayout(btn_row)
+
+        def _refresh():
+            lst.clear()
+            for p in self.settings.bg_images:
+                lst.addItem(os.path.basename(p))
+
+        def _add():
+            paths, _ = QFileDialog.getOpenFileNames(
+                self, "Select Background Images", "",
+                "Images (*.png *.jpg *.jpeg *.bmp *.webp)")
+            if paths:
+                self.settings.bg_images.extend(paths)
+                _refresh()
+                self.renderer.invalidate_bg()
+                self.changed.emit()
+
+        def _remove():
+            rows = sorted({i.row() for i in lst.selectedIndexes()}, reverse=True)
+            if not rows:
+                return
+            for r in rows:
+                if 0 <= r < len(self.settings.bg_images):
+                    del self.settings.bg_images[r]
+            _refresh()
+            self.renderer.invalidate_bg()
+            self.changed.emit()
+
+        def _clear():
+            self.settings.bg_images = []
+            _refresh()
+            self.renderer.invalidate_bg()
+            self.changed.emit()
+
+        add_btn.clicked.connect(_add)
+        rm_btn.clicked.connect(_remove)
+        clr_btn.clicked.connect(_clear)
+
+        # ── NEW: random-from-folder picker ─────────────────────────────
+        sep = QLabel("— o kumuha ng random sa isang folder —")
+        sep.setStyleSheet("color:#8090a0;font-size:10px;")
+        layout.addWidget(sep)
+
+        dir_row = QHBoxLayout()
+        dir_row.setContentsMargins(0, 0, 0, 0)
+        dir_disp = QLabel(self._short_dir(getattr(self.settings, "bg_images_dir", None)))
+        dir_disp.setStyleSheet("color:#80a0c0;font-size:10px;")
+        dir_disp.setWordWrap(True)
+        dir_disp.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        dir_btn = QPushButton("📁 Set Folder…")
+        dir_btn.setFixedWidth(100)
+        dir_row.addWidget(dir_disp); dir_row.addWidget(dir_btn)
+        layout.addLayout(dir_row)
+
+        self._slider_row(layout, "Random Count", "bg_images_random_count", 1, 200, 1)
+
+        rand_btn = QPushButton("🎲 Pick Random Images")
+        rand_btn.setProperty("class", "action")
+        layout.addWidget(rand_btn)
+
+        def _set_dir():
+            d = QFileDialog.getExistingDirectory(self, "Select Image Folder")
+            if d:
+                self.settings.bg_images_dir = d
+                dir_disp.setText(self._short_dir(d))
+                self.changed.emit()
+
+        def _randomize():
+            d = getattr(self.settings, "bg_images_dir", None)
+            if not d or not os.path.isdir(d):
+                QMessageBox.warning(self, "Walang Folder",
+                                     "Pumili muna ng folder na may laman na images.")
+                return
+            pool = scan_images_in_dir(d)
+            if not pool:
+                QMessageBox.warning(self, "Walang Nahanap na Image",
+                                     "Walang image file na nahanap sa folder na ito.")
+                return
+            n = min(int(getattr(self.settings, "bg_images_random_count", 10)), len(pool))
+            self.settings.bg_images = random.sample(pool, n)
+            _refresh()
+            self.renderer.invalidate_bg()
+            self.changed.emit()
+            self._status_hint = f"{n} random image(s) mula sa {len(pool)} sa folder."
+
+        dir_btn.clicked.connect(_set_dir)
+        rand_btn.clicked.connect(_randomize)
+
+        self._bg_images_refresh = _refresh
+
     def _build(self):
         self._widgets:    Dict[str, QWidget] = {}
         self._val_labels: Dict[str, QLabel]  = {}
@@ -2384,6 +2720,24 @@ class SettingsPanel(QScrollArea):
         self._file_row(g, "Video", "bg_video_path",
                        "Video (*.mp4 *.mkv *.mov *.avi *.webm)")
         self._check_row(g, "Mute video (use imported audio)", "bg_video_muted")
+
+        # ── Background Slideshow ─────────────────────────────────────────
+        g = self._group("Background Slideshow")
+        hint = QLabel("Add 2+ images below to slideshow them instead of the\n"
+                       "single Image above (video, if set, still takes priority).")
+        hint.setStyleSheet("color:#8090a0;font-size:10px;")
+        hint.setWordWrap(True)
+        g.addWidget(hint)
+        self._build_bg_images_list(g)
+        self._check_row(g, "Enable Slideshow (loops automatically)", "bg_slideshow_enabled")
+        self._slider_row(g, "Slide Duration (s×10)", "bg_slideshow_interval", 10, 300, 5)
+        self._combo_row(g, "Transition", "bg_slideshow_transition",
+                        ["none", "fade", "slide_left", "slide_right", "slide_up", "slide_down"])
+        self._slider_row(g, "Transition Time (s×10)", "bg_slideshow_transition_duration", 0, 50, 5)
+        self._check_row(g, "Ken Burns Zoom", "bg_zoom_enabled")
+        self._slider_row(g, "Zoom Speed (%/s)", "bg_zoom_speed", 0, 50, 1)
+        self._combo_row(g, "Zoom Direction", "bg_zoom_direction",
+                        ["in", "out", "alternate", "random"])
 
         # ── Lyric Style ──────────────────────────────────────────────────
         g = self._group("Lyric Style")
@@ -2546,6 +2900,9 @@ class SettingsPanel(QScrollArea):
             g = int(getattr(self.settings, kg, 128))
             b = int(getattr(self.settings, kb, 128))
             btn.setStyleSheet(f"background:rgb({r},{g},{b});border-radius:4px;")
+        # Refresh the background-images slideshow list (not a generic widget type)
+        if hasattr(self, "_bg_images_refresh"):
+            self._bg_images_refresh()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3379,7 +3736,15 @@ class MainWindow(QMainWindow):
             self._status(f"✗ Export failed: {msg}")
             self._log_msg(f"Export failed: {msg}")
 
-    # ── About ─────────────────────────────────────────────────────────────
+    # Edit this list to add/remove social links shown in the About dialog.
+    # Each entry is (button label, url).
+    SOCIAL_LINKS = [
+        ("▶ YouTube: Gallops Sound","https://www.youtube.com/@GallopsSound"),
+        ("▶ YouTube: Gallops OPM","https://www.youtube.com/@GallopsOPM"),
+        ("📘 Facebook: Gallops Sound","https://www.facebook.com/gallopssound"),
+        ("📘 Facebook: Gallops OPM","https://www.facebook.com/gallopsopm"),
+        ]
+
     def _show_about(self):
         dlg = QDialog(self)
         dlg.setWindowTitle("About Gallops Studio")
@@ -3387,13 +3752,24 @@ class MainWindow(QMainWindow):
         v = QVBoxLayout(dlg)
         v.addWidget(QLabel("<h2>Gallops Studio</h2>"))
         v.addWidget(QLabel("Karaoke Lyric Video Studio — PyQt6 Edition"))
-        v.addWidget(QLabel("Version 1.0.0  ·  © 2026 Jay-ar Volante / Gallops Sound"))
+        app_version, app_notes = get_app_version()
+        v.addWidget(QLabel(f"Version {app_version}  ·  © 2026 Jay-ar Volante"))
+        if app_notes:
+            notes_lbl = QLabel(f"What's new: {app_notes}")
+            notes_lbl.setWordWrap(True)
+            notes_lbl.setStyleSheet("color:#a0a0c0;font-size:10px;")
+            v.addWidget(notes_lbl)
+
+        v.addWidget(QLabel("Follow / support:"))
+        for label, url in self.SOCIAL_LINKS:
+            btn = QPushButton(label)
+            btn.clicked.connect(lambda _, u=url: __import__("webbrowser").open(u))
+            v.addWidget(btn)
+
         from PyQt6.QtWidgets import QDialogButtonBox
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
         bb.accepted.connect(dlg.accept)
-        yt = QPushButton("▶ YouTube: @GallopsSound")
-        yt.clicked.connect(lambda: __import__("webbrowser").open("https://www.youtube.com/@GallopsSound"))
-        v.addWidget(yt); v.addWidget(bb)
+        v.addWidget(bb)
         dlg.exec()
 
     # ── Helpers ───────────────────────────────────────────────────────────
